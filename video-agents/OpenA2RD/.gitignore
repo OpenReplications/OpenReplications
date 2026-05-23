@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+outputs/
+data/lvbench_c/*.json
+*.mp4
+*.png
+*.jpg
+.DS_Store
