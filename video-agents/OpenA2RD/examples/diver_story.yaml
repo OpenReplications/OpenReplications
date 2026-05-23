@@ -1,0 +1,20 @@
+# Diver story from A²RD paper Figure 3 (LVBench-C)
+# A diver prepares, dives, and returns to the ship.
+# Tests long-horizon consistency: character identity, environment, equipment.
+
+prompt: >
+  A professional diver prepares for a deep ocean dive from a boat,
+  descends into the water, explores a colorful coral reef,
+  and returns to climb back onto the deck.
+
+scenes:
+  - "The diver puts on a heavy air tank and harness."
+  - "The diver sits on the edge of the boat deck."
+  - "The diver sinks beneath the surface of the ocean."
+  - "The diver swims down toward a colorful coral reef."
+  - "The diver explores the coral reef, observing tropical fish."
+  - "The diver photographs a sea turtle near the reef."
+  - "The diver begins ascending back toward the surface."
+  - "The diver breaks through the surface of the water."
+  - "The diver swims toward the boat ladder."
+  - "The diver climbs up the ladder onto the deck."
