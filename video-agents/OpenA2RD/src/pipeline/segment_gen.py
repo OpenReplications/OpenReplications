@@ -263,7 +263,7 @@ def generate_segment(
     # --- (viii) Update MVMem ---
     # Extract full video textual states
     try:
-        frame_states_json = json.dumps(seg.frame_textual_states.__dict__) if seg.frame_textual_states else "{}"
+        frame_states_json = _textual_states_to_json(seg.frame_textual_states) if seg.frame_textual_states else "{}"
         full_states = call_mllm_json(
             prompt_extract_video_states(scene_idx, scene_desc, frame_states_json),
             videos=[video_path],
@@ -332,6 +332,23 @@ def _retrieve_end_frame_from_video(
             logger.warning(f"  End frame retrieval failed: {e}")
 
     return None
+
+
+def _textual_states_to_json(ts: TextualStates) -> str:
+    """Serialize TextualStates to JSON string."""
+    import json
+    return json.dumps({
+        "visual_arcs": [
+            {"entity_name": a.entity_name, "identity": a.identity,
+             "identity_changes": a.identity_changes, "motion": a.motion}
+            for a in ts.visual_arcs
+        ],
+        "spatial_relations": [
+            {"subject": r.subject, "relation": r.relation, "object": r.object}
+            for r in ts.spatial_relations
+        ],
+        "camera": ts.camera,
+    })
 
 
 def _parse_textual_states(frame_data: dict) -> TextualStates:

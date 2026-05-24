@@ -18,6 +18,7 @@ from src.memory.schema import MVMem, PromptDBEntry, SegmentMemory
 from src.models.mllm import call_mllm, call_mllm_json
 from src.models.ti2i import generate_image
 from src.models.ti2v import generate_video
+from src.pipeline.segment_gen import _textual_states_to_json
 from src.prompts.judges import (
     prompt_extract_frame_states,
     prompt_extract_video_states,
@@ -178,7 +179,7 @@ def refine_video(
 
         # --- Extract video states ---
         seg = mvmem.get_segment(scene_idx)
-        frame_states = json.dumps(seg.frame_textual_states.__dict__) if seg and seg.frame_textual_states else "{}"
+        frame_states = _textual_states_to_json(seg.frame_textual_states) if seg and seg.frame_textual_states else "{}"
         try:
             video_states = call_mllm_json(
                 prompt_extract_video_states(scene_idx, scene_description, frame_states),
