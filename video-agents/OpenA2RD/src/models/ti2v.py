@@ -68,8 +68,9 @@ def generate_video(
                 if veo_last:
                     gen_config.last_frame = veo_last
 
-            # Veo 3.1: set reference images for consistency (up to 3)
-            if reference_images:
+            # Veo 3.1: reference_images cannot be used together with image
+            # Only use reference_images when there's no begin_frame
+            if reference_images and not veo_image:
                 ref_imgs = []
                 for ref_path in reference_images[:3]:
                     ref_img = _to_veo_image(ref_path)
