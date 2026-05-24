@@ -17,6 +17,16 @@ from src.models.mllm import get_client
 
 logger = logging.getLogger(__name__)
 
+
+def _img_to_part(path):
+    """Convert image file to Gemini Part."""
+    import io
+    p = Path(path)
+    img = Image.open(p)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
+
 # Available image models (try in order):
 # 1. gemini-3.1-flash-image-preview (Nano Banana 2) - multimodal, supports references
 # 2. imagen-4.0-fast-generate-001 (Imagen 4 Fast) - text-only, separate quota
@@ -75,7 +85,7 @@ def _try_multimodal_generation(
             for ref_path in reference_images[:3]:
                 p = Path(ref_path)
                 if p.exists():
-                    contents.append(types.Part.from_image(Image.open(p)))
+                    contents.append(_img_to_part(p))
             contents.append(
                 f"Generate a high-quality, cinematic image following this prompt, "
                 f"maintaining strict visual consistency with the reference images:\n\n{prompt}"
@@ -138,7 +148,7 @@ def _try_gemini_flash_image(
             for ref_path in reference_images[:2]:
                 p = Path(ref_path)
                 if p.exists():
-                    contents.append(types.Part.from_image(Image.open(p)))
+                    contents.append(_img_to_part(p))
         contents.append(f"Generate a high-quality cinematic image:\n\n{prompt}")
 
         response = client.models.generate_content(

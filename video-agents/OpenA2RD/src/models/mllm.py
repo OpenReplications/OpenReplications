@@ -14,6 +14,16 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _image_to_part(path: Path | str) -> types.Part:
+    """Convert an image file to a Gemini API Part."""
+    import io
+    p = Path(path)
+    img = Image.open(p)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
+
 _client: genai.Client | None = None
 
 
@@ -54,7 +64,7 @@ def call_mllm(
         for img_path in images:
             p = Path(img_path)
             if p.exists():
-                contents.append(types.Part.from_image(Image.open(p)))
+                contents.append(_image_to_part(p))
             else:
                 logger.warning(f"Image not found: {img_path}")
 
@@ -133,3 +143,10 @@ def extract_json(text: str) -> dict | list:
                         break
 
     raise ValueError(f"No valid JSON found in response: {text[:500]}")
+
+
+def embed_text(text: str, model: str = "gemini-embedding-001") -> list[float]:
+    """Get embedding vector for a text string."""
+    client = get_client()
+    response = client.models.embed_content(model=model, contents=text)
+    return response.embeddings[0].values

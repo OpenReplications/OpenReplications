@@ -155,31 +155,32 @@ def generate_segment(
 
     if mode == "interpolation" and not is_last_scene:
         # For interpolation: need to determine end frame
-        # Check if contiguous video exists for frame retrieval
+        # Check if contiguous video exists for frame retrieval (E.2.5)
         if cont_idx is not None:
             cont_seg = mvmem.get_segment(cont_idx)
-            if cont_seg and cont_seg.video_path:
-                # MLLM_retr^img: retrieve best end-of-shot frame
-                # In practice, for simplicity we use the next scene's begin frame prompt
-                pass
+            if cont_seg and cont_seg.video_path and cont_seg.video_path.exists():
+                end_frame_path = _retrieve_end_frame_from_video(
+                    cont_seg, scene_desc, seg_dir,
+                )
 
-        # Generate end frame from next scene's prompt
-        next_scene_idx = scene_idx + 1
-        end_prompt = frame_prompts.get(next_scene_idx, {}).get(
-            "begin_frame", scenes[next_scene_idx] if next_scene_idx < len(scenes) else ""
-        )
-        if end_prompt:
-            end_frame_path = seg_dir / "end_frame.png"
-            end_frame_path = generate_image(
-                prompt=end_prompt,
-                reference_images=context.get("relevant_ref_frames", [])[:4],
-                output_path=end_frame_path,
+        # If retrieval didn't yield a frame, generate one
+        if end_frame_path is None:
+            next_scene_idx = scene_idx + 1
+            end_prompt = frame_prompts.get(next_scene_idx, {}).get(
+                "begin_frame", scenes[next_scene_idx] if next_scene_idx < len(scenes) else ""
             )
-            # HITS refinement for end frame
-            end_frame_path, end_prompt, _ = refine_frame(
-                end_frame_path, end_prompt, scene_idx, scene_desc,
-                mvmem, context, frame_type="end", output_dir=seg_dir,
-            )
+            if end_prompt:
+                end_frame_path = seg_dir / "end_frame.png"
+                end_frame_path = generate_image(
+                    prompt=end_prompt,
+                    reference_images=context.get("relevant_ref_frames", [])[:4],
+                    output_path=end_frame_path,
+                )
+                # HITS refinement for end frame
+                end_frame_path, end_prompt, _ = refine_frame(
+                    end_frame_path, end_prompt, scene_idx, scene_desc,
+                    mvmem, context, frame_type="end", output_dir=seg_dir,
+                )
 
     elif is_last_scene:
         # Last scene: generate end frame
@@ -200,8 +201,7 @@ def generate_segment(
             prompt_extract_frame_states(scene_idx, scene_desc, "begin frame"),
             images=[begin_frame_path],
         )
-        # Store as TextualStates (simplified)
-        seg.frame_textual_states = TextualStates(camera=json.dumps(frame_states))
+        seg.frame_textual_states = _parse_textual_states(frame_states)
     except Exception as e:
         logger.warning(f"  Frame state extraction failed: {e}")
 
@@ -267,7 +267,7 @@ def generate_segment(
             prompt_extract_video_states(scene_idx, scene_desc, frame_states_json),
             videos=[video_path],
         )
-        seg.textual_states = TextualStates(camera=json.dumps(full_states))
+        seg.textual_states = _parse_textual_states_from_video(full_states, seg.frame_textual_states)
     except Exception as e:
         logger.warning(f"  Video state extraction failed: {e}")
 
@@ -275,3 +275,114 @@ def generate_segment(
     logger.info(f"  Segment {scene_idx} complete: {video_path}")
 
     return mvmem
+
+
+def _retrieve_end_frame_from_video(
+    cont_seg: SegmentMemory,
+    curr_scene: str,
+    output_dir: Path,
+) -> Path | None:
+    """E.2.5 - MLLM_retr^img: retrieve best end-of-shot frame from contiguous video.
+
+    Extracts candidate frames from the contiguous segment's video,
+    then asks the MLLM to pick the best continuation frame.
+    """
+    import subprocess
+    import tempfile
+
+    video_path = cont_seg.video_path
+    if not video_path or not video_path.exists():
+        return None
+
+    # Extract candidate frames at regular intervals using ffmpeg
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-i", str(video_path), "-vf", "fps=1", "-q:v", "2",
+                 str(tmpdir / "frame_%03d.png")],
+                capture_output=True, check=True, timeout=30,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warning(f"  Frame extraction failed: {e}")
+            return None
+
+        frames = sorted(tmpdir.glob("frame_*.png"))
+        if not frames:
+            return None
+
+        # Ask MLLM to pick the best end-of-shot frame
+        image_mapping = ", ".join(f"Image {i+1}: frame at {i+1}s" for i in range(len(frames)))
+        try:
+            result = call_mllm_json(
+                prompt_retrieve_end_frame(
+                    cont_seg.scene_context, curr_scene, image_mapping
+                ),
+                images=frames,
+            )
+            best_idx = result.get("best_index")
+            if best_idx is not None and 0 <= best_idx < len(frames):
+                dest = output_dir / "end_frame.png"
+                import shutil
+                shutil.copy2(frames[best_idx], dest)
+                logger.info(f"  Retrieved end frame from contiguous video (frame {best_idx})")
+                return dest
+        except Exception as e:
+            logger.warning(f"  End frame retrieval failed: {e}")
+
+    return None
+
+
+def _parse_textual_states(frame_data: dict) -> TextualStates:
+    """Parse MLLM-extracted frame states into TextualStates with proper fields."""
+    from src.memory.schema import SpatialRelation, VisualArc
+
+    arcs = []
+    entities = frame_data.get("entities", {})
+    for name, info in entities.items():
+        if isinstance(info, dict):
+            arcs.append(VisualArc(
+                entity_name=name,
+                identity=info.get("identity", ""),
+                identity_changes="",
+                motion="",
+            ))
+
+    relations = []
+    for rel in frame_data.get("spatial_relations", []):
+        if isinstance(rel, dict):
+            relations.append(SpatialRelation(
+                subject=rel.get("subject", ""),
+                relation=rel.get("relation", ""),
+                object=rel.get("object", ""),
+            ))
+
+    return TextualStates(visual_arcs=arcs, spatial_relations=relations, camera="")
+
+
+def _parse_textual_states_from_video(video_data: dict, frame_states: TextualStates | None) -> TextualStates:
+    """Merge video-extracted states with frame-level states."""
+    from src.memory.schema import SpatialRelation, VisualArc
+
+    arcs = list(frame_states.visual_arcs) if frame_states else []
+    relations = list(frame_states.spatial_relations) if frame_states else []
+
+    existing_names = {a.entity_name for a in arcs}
+    identity_changes = video_data.get("identity_changes", {})
+    motions = video_data.get("motions", {})
+
+    for arc in arcs:
+        arc.identity_changes = identity_changes.get(arc.entity_name, "")
+        arc.motion = motions.get(arc.entity_name, "")
+
+    for name, desc in video_data.get("new_entities", {}).items():
+        if name not in existing_names:
+            arcs.append(VisualArc(
+                entity_name=name,
+                identity=desc,
+                identity_changes=identity_changes.get(name, ""),
+                motion=motions.get(name, ""),
+            ))
+
+    camera = video_data.get("camera", "")
+    return TextualStates(visual_arcs=arcs, spatial_relations=relations, camera=camera)

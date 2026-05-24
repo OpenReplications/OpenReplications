@@ -118,18 +118,26 @@ def refine_frame(
             logger.info(f"  Regenerate mode: MAPO optimization")
             refined_prompt = _mapo_optimize(current_prompt, scores, mvmem)
 
-        # Generate new frame with refined prompt
-        new_path = out / f"frame_{frame_type}_s{scene_idx}_iter{iteration+1}.png"
-        try:
-            ref_images = context.get("relevant_ref_frames", [])
-            new_path = generate_image(
-                prompt=refined_prompt,
-                reference_images=ref_images,
-                output_path=new_path,
-            )
-            candidates.append((new_path, refined_prompt))
-        except Exception as e:
-            logger.warning(f"  Frame regeneration failed: {e}")
+        # Generate N candidates, pick the best (best-of-N)
+        n_candidates = settings.max_candidates_per_frame
+        ref_images = context.get("relevant_ref_frames", [])
+        iter_candidates = []
+        for c_idx in range(n_candidates):
+            new_path = out / f"frame_{frame_type}_s{scene_idx}_iter{iteration+1}_c{c_idx}.png"
+            try:
+                new_path = generate_image(
+                    prompt=refined_prompt,
+                    reference_images=ref_images,
+                    output_path=new_path,
+                )
+                iter_candidates.append((new_path, refined_prompt))
+            except Exception as e:
+                logger.warning(f"  Frame candidate {c_idx} failed: {e}")
+        if iter_candidates:
+            candidates.append(iter_candidates[0])  # will be re-evaluated next iteration
+            # TODO: evaluate all N and pick best here for efficiency
+        else:
+            logger.warning(f"  All {n_candidates} frame candidates failed")
 
     # Update MAPO prompt database
     _update_prompt_db(mvmem, best_prompt, frame_prompt, best_scores, best_avg > 0.8 * threshold)
@@ -194,22 +202,41 @@ def refine_video(
             best_prompt = current_prompt
             best_scores = scores
 
-        if avg_score >= threshold or iteration >= max_iters:
+        if avg_score >= threshold:
+            logger.info(f"  Video HITS early stop at iter {iteration} (avg={avg_score:.1f})")
+            break
+        if iteration >= max_iters:
             break
 
-        # --- Refine and regenerate ---
-        refined_prompt = _mapo_optimize(current_prompt, scores, mvmem)
-        new_path = out / f"segment_s{scene_idx}_iter{iteration+1}.mp4"
-        try:
-            new_path = generate_video(
-                prompt=refined_prompt,
-                begin_frame=begin_frame,
-                end_frame=end_frame,
-                output_path=new_path,
-            )
-            candidates.append((new_path, refined_prompt))
-        except Exception as e:
-            logger.warning(f"  Video regeneration failed: {e}")
+        # --- Decide Edit or Regenerate (same logic as frame HITS) ---
+        low_scores = {k: v for k, v in scores.items() if v < 8}
+        if len(low_scores) <= 1 and low_scores:
+            issue = list(low_scores.keys())[0]
+            logger.info(f"  Video Edit mode: fixing {issue}")
+            refined_prompt = _edit_prompt(current_prompt, scores, issue)
+        else:
+            logger.info(f"  Video Regenerate mode: MAPO optimization")
+            refined_prompt = _mapo_optimize(current_prompt, scores, mvmem)
+
+        # Generate N video candidates, pick best
+        n_candidates = settings.max_candidates_per_video
+        iter_candidates = []
+        for c_idx in range(n_candidates):
+            new_path = out / f"segment_s{scene_idx}_iter{iteration+1}_c{c_idx}.mp4"
+            try:
+                new_path = generate_video(
+                    prompt=refined_prompt,
+                    begin_frame=begin_frame,
+                    end_frame=end_frame,
+                    output_path=new_path,
+                )
+                iter_candidates.append((new_path, refined_prompt))
+            except Exception as e:
+                logger.warning(f"  Video candidate {c_idx} failed: {e}")
+        if iter_candidates:
+            candidates.append(iter_candidates[0])
+        else:
+            logger.warning(f"  All {n_candidates} video candidates failed")
 
     _update_prompt_db(mvmem, best_prompt, video_prompt, best_scores, best_avg > 0.8 * threshold)
 
@@ -247,7 +274,37 @@ def _judge_frame(
     except Exception as e:
         logger.warning(f"  Frame consistency judge failed: {e}")
 
-    # Judge 2: Basic quality (E.3.6)
+    # Judge 2: Spatial logicalness (E.3.4)
+    try:
+        result = call_mllm_json(
+            prompt_judge_frame_spatial(scenes_text, scene_idx, scene_desc, frame_prompt, image_mapping),
+            images=[frame_path] + ref_images[:5],
+        )
+        if "spatial_logicalness" in result:
+            all_scores["spatial_logicalness"] = result["spatial_logicalness"]
+    except Exception as e:
+        logger.warning(f"  Frame spatial judge failed: {e}")
+
+    # Judge 3: Textual states consistency (E.3.5)
+    if context.get("relevant_states"):
+        try:
+            video_states = json.dumps([
+                {"scene": s["scene_index"], "context": s["scene_context"]}
+                for s in context["relevant_states"][:3]
+            ])
+            result = call_mllm_json(
+                prompt_judge_frame_states(
+                    scenes_text, scene_idx, scene_desc, video_states, json.dumps(states)
+                ),
+                images=[frame_path],
+            )
+            for key in ["objects_state_score", "characters_state_score", "environment_state_score"]:
+                if key in result:
+                    all_scores[key] = result[key]
+        except Exception as e:
+            logger.warning(f"  Frame states judge failed: {e}")
+
+    # Judge 4: Basic quality (E.3.6)
     try:
         result = call_mllm_json(
             prompt_judge_frame_quality(frame_prompt, json.dumps(states)),
@@ -327,16 +384,15 @@ def _edit_prompt(prompt: str, scores: dict, issue: str) -> str:
 
 
 def _mapo_optimize(prompt: str, scores: dict, mvmem: MVMem) -> str:
-    """MAPO: Memory-Augmented Prompt Optimization."""
-    # Retrieve similar cases from prompt DB
-    pos_cases = [
-        {"original_prompt": e.original_prompt, "refined_prompt": e.refined_prompt, "rubric_scores": e.rubric_scores}
-        for e in mvmem.prompt_db if e.label == "pos"
-    ][-5:]
-    neg_cases = [
-        {"original_prompt": e.original_prompt, "refined_prompt": e.refined_prompt, "rubric_scores": e.rubric_scores}
-        for e in mvmem.prompt_db if e.label == "neg"
-    ][-5:]
+    """MAPO: Memory-Augmented Prompt Optimization.
+
+    Retrieves similar past cases from prompt DB via embedding cosine similarity,
+    then contrasts positive/negative examples to derive refinement lessons.
+    """
+    from src.models.mllm import embed_text
+
+    pos_cases = _retrieve_similar_cases(prompt, mvmem, label="pos", top_k=5)
+    neg_cases = _retrieve_similar_cases(prompt, mvmem, label="neg", top_k=5)
 
     try:
         result = call_mllm_json(prompt_mapo_feedback_reasoning(prompt, scores, pos_cases, neg_cases))
@@ -345,11 +401,63 @@ def _mapo_optimize(prompt: str, scores: dict, mvmem: MVMem) -> str:
         return prompt
 
 
+def _retrieve_similar_cases(
+    query: str, mvmem: MVMem, label: str, top_k: int = 5
+) -> list[dict]:
+    """Retrieve top-k most similar prompt DB entries by embedding cosine similarity."""
+    from src.models.mllm import embed_text
+
+    candidates = [e for e in mvmem.prompt_db if e.label == label and e.embedding]
+    if not candidates:
+        # Fallback to most recent if no embeddings available
+        return [
+            {"original_prompt": e.original_prompt, "refined_prompt": e.refined_prompt, "rubric_scores": e.rubric_scores}
+            for e in mvmem.prompt_db if e.label == label
+        ][-top_k:]
+
+    try:
+        query_emb = embed_text(query)
+    except Exception:
+        return [
+            {"original_prompt": e.original_prompt, "refined_prompt": e.refined_prompt, "rubric_scores": e.rubric_scores}
+            for e in candidates
+        ][-top_k:]
+
+    scored = []
+    for e in candidates:
+        sim = _cosine_similarity(query_emb, e.embedding)
+        scored.append((sim, e))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    return [
+        {"original_prompt": e.original_prompt, "refined_prompt": e.refined_prompt, "rubric_scores": e.rubric_scores}
+        for _, e in scored[:top_k]
+    ]
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def _update_prompt_db(mvmem: MVMem, refined: str, original: str, scores: dict, is_positive: bool):
-    """Update MAPO prompt database with new case."""
+    """Update MAPO prompt database with new case and its embedding."""
+    from src.models.mllm import embed_text
+
+    embedding = []
+    try:
+        embedding = embed_text(refined)
+    except Exception as e:
+        logger.warning(f"  Failed to embed prompt for MAPO DB: {e}")
+
     mvmem.prompt_db.append(PromptDBEntry(
         original_prompt=original,
         refined_prompt=refined,
         rubric_scores=scores,
         label="pos" if is_positive else "neg",
+        embedding=embedding,
     ))

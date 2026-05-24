@@ -12,9 +12,10 @@ from pathlib import Path
 
 from src.config import settings
 from src.memory.schema import Entity, MVMem, ReferenceFrame
-from src.models.mllm import call_mllm_json
+from src.models.mllm import call_mllm, call_mllm_json
 from src.models.ti2i import generate_image
 from src.prompts.mvmem_init import (
+    prompt_caption_user_image,
     prompt_dependency_graph,
     prompt_plan_entities,
     prompt_plan_environments,
@@ -124,14 +125,23 @@ def initialize_mvmem(
         except Exception as e:
             logger.error(f"    Failed to synthesize {ref.name}: {e}")
 
-    # --- Handle user-provided reference images ---
+    # --- Handle user-provided reference images (MLLM_cap) ---
     if ref_image_paths:
         for i, path in enumerate(ref_image_paths):
             p = Path(path)
             if p.exists():
+                # Caption user image via MLLM
+                try:
+                    caption = call_mllm(
+                        prompt_caption_user_image(), images=[p]
+                    )
+                    logger.info(f"  Captioned user ref {i}: {caption[:80]}...")
+                except Exception as e:
+                    logger.warning(f"  Failed to caption user ref {i}: {e}")
+                    caption = f"User-provided reference image {i}"
                 mvmem.references.append(ReferenceFrame(
                     name=f"user_ref_{i}",
-                    caption=f"User-provided reference image {i}",
+                    caption=caption,
                     image_path=p,
                     ref_type="user",
                 ))
