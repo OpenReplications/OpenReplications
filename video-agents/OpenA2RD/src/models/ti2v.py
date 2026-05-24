@@ -1,9 +1,9 @@
 """Text-Image-to-Video (TI2V) generation interface.
 
 Uses Veo 2.0 (veo-2.0-generate-001) via Gemini API.
+Image must be passed as types.Image(image_bytes=..., mime_type=...).
 """
 
-import io
 import logging
 import time
 from pathlib import Path
@@ -39,54 +39,35 @@ def generate_video(
 
     for attempt in range(max_retries):
         try:
-            # Prepare image conditioning
-            image = _load_and_resize(begin_frame) if begin_frame else None
-            end_image = _load_and_resize(end_frame) if end_frame else None
+            # Convert image to types.Image format (bytes + mime_type)
+            veo_image = _to_veo_image(begin_frame)
 
-            # Build generation config
-            gen_config = types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio,
-                number_of_videos=1,
-            )
-
-            # For interpolation (both begin + end frames), embed end frame info in prompt
+            # For interpolation, embed end frame context in prompt
             effective_prompt = prompt
-            if end_image and image:
+            if end_frame and Path(end_frame).exists() and veo_image:
                 effective_prompt = (
                     f"{prompt}\n\nIMPORTANT: The video must transition smoothly "
                     f"from the beginning frame to the ending frame provided."
                 )
 
-            # Use Veo API
             response = client.models.generate_videos(
                 model=VIDEO_MODEL,
                 prompt=effective_prompt,
-                image=image,
-                config=gen_config,
+                image=veo_image,
+                config=types.GenerateVideosConfig(
+                    aspect_ratio=aspect_ratio,
+                    number_of_videos=1,
+                ),
             )
 
             # Poll for completion
-            start_time = time.time()
-            while True:
-                elapsed = time.time() - start_time
-                if elapsed > max_poll_time:
-                    logger.warning(f"Video generation timed out after {max_poll_time}s")
-                    break
+            video = _poll_video(client, response, poll_interval, max_poll_time)
+            if video:
+                _save_video(video, output_path)
+                logger.info(f"Generated video: {output_path}")
+                return output_path
 
-                result = client.operations.get(operation=response)
-
-                if result.done:
-                    if result.response and result.response.generated_videos:
-                        video = result.response.generated_videos[0]
-                        video.video.save(str(output_path))
-                        logger.info(f"Generated video: {output_path}")
-                        return output_path
-                    else:
-                        logger.warning("Video generation completed but no video returned")
-                        break
-
-                logger.debug(f"Video generating... ({elapsed:.0f}s elapsed)")
-                time.sleep(poll_interval)
+            logger.warning("Video generation completed but no video returned")
 
         except Exception as e:
             err_str = str(e)
@@ -104,20 +85,11 @@ def generate_video(
                             number_of_videos=1,
                         ),
                     )
-                    start_time = time.time()
-                    while True:
-                        elapsed = time.time() - start_time
-                        if elapsed > max_poll_time:
-                            break
-                        result = client.operations.get(operation=response)
-                        if result.done:
-                            if result.response and result.response.generated_videos:
-                                video = result.response.generated_videos[0]
-                                video.video.save(str(output_path))
-                                logger.info(f"Generated video (no image): {output_path}")
-                                return output_path
-                            break
-                        time.sleep(poll_interval)
+                    video = _poll_video(client, response, poll_interval, max_poll_time)
+                    if video:
+                        _save_video(video, output_path)
+                        logger.info(f"Generated video (no image): {output_path}")
+                        return output_path
                 except Exception as e2:
                     logger.warning(f"  Text-only video also failed: {e2}")
 
@@ -130,13 +102,82 @@ def generate_video(
     raise RuntimeError(f"Failed to generate video after {max_retries} attempts")
 
 
-def _load_and_resize(path: Path | None, max_dim: int = 1024) -> Image.Image | None:
-    """Load image and resize if too large for Veo API."""
+def _to_veo_image(path: Path | None, max_dim: int = 1024) -> types.Image | None:
+    """Convert image file to types.Image(image_bytes, mime_type) for Veo API."""
     if not path or not Path(path).exists():
         return None
+
+    import io
+
     img = Image.open(path)
+
+    # Resize if too large
     if max(img.size) > max_dim:
         ratio = max_dim / max(img.size)
         new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
         img = img.resize(new_size, Image.LANCZOS)
-    return img
+
+    # Convert to PNG bytes
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    raw = buf.getvalue()
+
+    return types.Image(image_bytes=raw, mime_type="image/png")
+
+
+def _poll_video(client, operation, poll_interval: int, max_poll_time: int):
+    """Poll a video generation operation until done."""
+    start_time = time.time()
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > max_poll_time:
+            logger.warning(f"Video generation timed out after {max_poll_time}s")
+            return None
+
+        result = client.operations.get(operation=operation)
+
+        if result.done:
+            if result.response and result.response.generated_videos:
+                return result.response.generated_videos[0]
+            if result.error:
+                logger.warning(f"Video generation error: {result.error}")
+            return None
+
+        logger.debug(f"Video generating... ({elapsed:.0f}s elapsed)")
+        time.sleep(poll_interval)
+
+
+def _save_video(video, output_path: Path):
+    """Save generated video to disk, handling both local and remote cases."""
+    # Try direct save first (works for local/inline videos)
+    try:
+        video.video.save(str(output_path))
+        return
+    except Exception:
+        pass
+
+    # If video has a URI, download it with API key auth
+    uri = getattr(video.video, 'uri', None)
+    if uri:
+        import httpx
+        try:
+            # Append API key for authentication
+            sep = "&" if "?" in uri else "?"
+            auth_uri = f"{uri}{sep}key={settings.gemini_api_key}"
+            with httpx.Client(timeout=120, follow_redirects=True) as http:
+                resp = http.get(auth_uri)
+                resp.raise_for_status()
+                with open(output_path, 'wb') as f:
+                    f.write(resp.content)
+            logger.info(f"Downloaded video from URI ({len(resp.content)//1024}KB)")
+            return
+        except Exception as e:
+            logger.warning(f"URI download failed: {e}")
+
+    # If video has bytes directly
+    if video.video.video_bytes:
+        with open(output_path, 'wb') as f:
+            f.write(video.video.video_bytes)
+        return
+
+    raise RuntimeError("Cannot save video: no bytes, no URI")
