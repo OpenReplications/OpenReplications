@@ -68,15 +68,15 @@ def generate_video(
                 if veo_last:
                     gen_config.last_frame = veo_last
 
-            # Veo 3.1: set reference images for consistency
+            # Veo 3.1: set reference images for consistency (up to 3)
             if reference_images:
                 ref_imgs = []
-                for i, ref_path in enumerate(reference_images[:3]):
+                for ref_path in reference_images[:3]:
                     ref_img = _to_veo_image(ref_path)
                     if ref_img:
-                        ref_imgs.append(types.RawReferenceImage(
-                            reference_id=i + 1,
-                            reference_image=ref_img,
+                        ref_imgs.append(types.VideoGenerationReferenceImage(
+                            image=ref_img,
+                            reference_type="asset",
                         ))
                 if ref_imgs:
                     gen_config.reference_images = ref_imgs
