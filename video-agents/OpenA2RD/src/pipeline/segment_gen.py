@@ -246,6 +246,7 @@ def generate_segment(
         prompt=video_prompt,
         begin_frame=begin_frame_path,
         end_frame=end_frame_path,
+        reference_images=context.get("relevant_ref_frames", [])[:3],
         output_path=video_path,
     )
 
